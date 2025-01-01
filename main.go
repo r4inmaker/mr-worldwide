@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -19,17 +20,24 @@ import (
 var clientID string
 var clientSecret string
 var redirectURL string
+var accessToken string
+var baseURL string
+
+// ENV VARIABLES
 
 func init() {
 	err := godotenv.Load()
 	if err != nil {
-		log.Fatal("Error loading .env file %v", err)
+		log.Fatalf("Error loading .env file %v", err)
 	}
 
 	clientID = os.Getenv("CLIENT_ID")
 	clientSecret = os.Getenv("CLIENT_SECRET")
 	redirectURL = os.Getenv("REDIRECT_URI")
+	baseURL = os.Getenv("BASE_URL")
 }
+
+// SERVER
 
 func main() {
 	// Initialize a random seed
@@ -40,16 +48,66 @@ func main() {
 	mux.HandleFunc("/", indexHandler)
 	mux.HandleFunc("/login", loginHandler)
 	mux.HandleFunc("/callback", callbackHandler)
+	mux.HandleFunc("/getPlaylist/{id}", getPlaylistHandler)
 
 	print("Starting server on 3000 ...")
 	log.Fatal(http.ListenAndServe(":3000", mux))
 }
+
+// ROUTE HANDLERS
 
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Hello Mista.")
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
+	login(w, r)
+}
+
+func callbackHandler(w http.ResponseWriter, r *http.Request) {
+	queryParams := r.URL.Query()
+	code := queryParams.Get("code")
+	state := queryParams.Get("state")
+
+	// Auth Failure
+	if code == "" {
+		http.Error(w, "Did not recieve a code: "+state, http.StatusBadRequest)
+		return
+	}
+
+	_accessToken, err := getAccessToken(code)
+	if err != nil {
+		fmt.Printf("Error obtaining an acess token: %v", err)
+	}
+
+	accessToken = _accessToken
+	fmt.Fprintf(w, "Access token recieved: %v,", accessToken)
+}
+
+func getPlaylistHandler(w http.ResponseWriter, r *http.Request) {
+
+	//get playlist ID
+	base_path := "/getPlaylist/"
+	playlistID := strings.TrimPrefix(r.URL.Path, base_path)
+
+	if playlistID == "" {
+		http.Error(w, "You need to provide a playlist ID", http.StatusBadRequest)
+		return
+	}
+
+	url := "https://api.spotify.com/v1/playlists/" + playlistID
+
+	data, err := getPlaylist(accessToken, url)
+	if err != nil {
+		fmt.Fprintf(w, "skill issue: %v", err)
+	}
+
+	fmt.Fprintln(w, data)
+}
+
+// UTILITY FUNCTIONS
+
+func login(w http.ResponseWriter, r *http.Request) {
 	authURL := "https://accounts.spotify.com/authorize"
 	redirectURL := "http://localhost:3000/callback"
 	scope := "user-read-private user-read-email"
@@ -72,26 +130,6 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, urlObj.String(), http.StatusFound)
 }
 
-func callbackHandler(w http.ResponseWriter, r *http.Request) {
-	queryParams := r.URL.Query()
-	code := queryParams.Get("code")
-	state := queryParams.Get("state")
-
-	// Auth Failure
-	if code == "" {
-		http.Error(w, "Did not recieve a code: "+state, http.StatusBadRequest)
-		return
-	}
-
-	accessToken, err := getAccessToken(code)
-	if err != nil {
-		fmt.Printf("Error obtaining an acess token: %v", err)
-	}
-
-	fmt.Fprintf(w, "here is your access token sire: %v", accessToken)
-}
-
-// Utility Functions
 func getAccessToken(code string) (string, error) {
 	// Exchange code for auth token
 	auth := base64.StdEncoding.EncodeToString([]byte(clientID + ":" + clientSecret))
@@ -136,6 +174,62 @@ func getAccessToken(code string) (string, error) {
 	}
 
 	return accessToken, nil
+}
+
+type Playlist struct {
+	Tracks struct {
+		Items []struct {
+			Track struct {
+				Name    string `json:"name"`
+				Artists []struct {
+					Name string `json:"name"`
+				} `json:"artists"`
+			} `json:"track"`
+		} `json:"items"`
+	} `json:"tracks"`
+}
+
+func getPlaylist(_accessToken string, url string) (string, error) {
+
+	// send a request
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create a request: %v", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+_accessToken)
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send the request: %v", err)
+	}
+
+	defer resp.Body.Close()
+
+	// read body in bytes
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	// parse json
+	var playlist Playlist
+	err = json.Unmarshal(bodyBytes, &playlist)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse json: %v", err)
+	}
+
+	for _, item := range playlist.Tracks.Items {
+		_artists := ""
+		_trackName := "- " + item.Track.Name
+		for _, artist := range item.Track.Artists {
+			_artist := artist.Name + " "
+			_artists += _artist
+		}
+		fmt.Println(_artists + _trackName)
+	}
+
+	return "Success!", nil
 }
 
 func print(args ...interface{}) {
