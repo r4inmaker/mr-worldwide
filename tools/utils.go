@@ -11,10 +11,6 @@ import (
 	"net/url"
 )
 
-func print(args ...interface{}) {
-	fmt.Println(args...)
-}
-
 func generateRandomString(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	var result string
@@ -25,7 +21,7 @@ func generateRandomString(length int) string {
 	return result
 }
 
-func login(w http.ResponseWriter, r *http.Request) {
+func loginSpotify(w http.ResponseWriter, r *http.Request) {
 	authURL := "https://accounts.spotify.com/authorize"
 	redirectURL := "http://localhost:3000/callback"
 	scope := "user-read-private user-read-email"
@@ -33,7 +29,7 @@ func login(w http.ResponseWriter, r *http.Request) {
 
 	urlObj, err := url.Parse(authURL)
 	if err != nil {
-		http.Error(w, "Error generating URL", http.StatusInternalServerError)
+		http.Error(w, "error generating URL", http.StatusInternalServerError)
 		return
 	}
 
@@ -48,7 +44,30 @@ func login(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, urlObj.String(), http.StatusFound)
 }
 
-func getAccessToken(code string) (string, error) {
+func loginGenius(w http.ResponseWriter, r *http.Request) {
+	authURL := "https://api.genius.com/oauth/authorize"
+	scope := "me"
+	state := generateRandomString(16)
+	response_type := "code"
+
+	urlObj, err := url.Parse(authURL)
+	if err != nil {
+		http.Error(w, "error Generating URL", http.StatusInternalServerError)
+		return
+	}
+
+	queryParams := url.Values{}
+	queryParams.Set("client_id", geniusID)
+	queryParams.Set("redirect_uri", geniusRedirectURL)
+	queryParams.Set("scope", scope)
+	queryParams.Set("state", state)
+	queryParams.Set("response_type", response_type)
+
+	urlObj.RawQuery = queryParams.Encode()
+	http.Redirect(w, r, urlObj.String(), http.StatusFound)
+}
+
+func getSpotifyAccessToken(code string) (string, error) {
 	// Exchange code for auth token
 	auth := base64.StdEncoding.EncodeToString([]byte(clientID + ":" + clientSecret))
 
@@ -94,6 +113,70 @@ func getAccessToken(code string) (string, error) {
 	return accessToken, nil
 }
 
+type AccessTokenRequest struct {
+	Code         string `json:"code"`
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+	RedirectURI  string `json:"redirect_uri"`
+	ResponseType string `json:"response_type"`
+	GrantType    string `json:"grant_type"`
+}
+
+type AccessTokenResponse struct {
+	AccessToken string `json:"access_token"`
+}
+
+func getGeniusAccesToken(code string) (string, error) {
+	url := "https://api.genius.com/oauth/token"
+
+	payload := AccessTokenRequest{
+		Code:         code,
+		ClientID:     geniusID,
+		ClientSecret: geniusSecret,
+		RedirectURI:  geniusRedirectURL,
+		ResponseType: "code",
+		GrantType:    "authorization_code",
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+
+	if err != nil {
+		return "", err
+	}
+
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("genius API error: %s, response: %s", string(bodyBytes), resp.Status)
+	}
+
+	var accessTokenResponse AccessTokenResponse
+	err = json.Unmarshal(bodyBytes, &accessTokenResponse)
+	if err != nil {
+		return "", err
+	}
+
+	return accessTokenResponse.AccessToken, nil
+}
+
 type Playlist struct {
 	Tracks struct {
 		Items []struct {
@@ -113,35 +196,39 @@ type Results struct {
 		Title   string `json:"title"`
 		Preview string `json:"preview"`
 		Artist  struct {
-			ArtistName string `json:"name"`
-			ArtistId   int    `json:"id"`
-			Picture    string `json:"picture_medium"`
+			ArtistName    string `json:"name"`
+			ArtistId      int    `json:"id"`
+			ArtistPicture string `json:"picture_medium"`
 		} `json:"artist"`
+		Album struct {
+			AlbumPicture string `json:"cover_medium"`
+		} `json:"album"`
 	} `json:"data"`
 }
 
 type TrackInfo struct {
-	TrackID        int
-	ArtistID       int
-	ArtistName     string
-	Title          string
-	PreviewLink    string
-	PreviewPicture string
+	TrackID       int
+	ArtistID      int
+	ArtistName    string
+	Title         string
+	PreviewLink   string
+	ArtistPicture string
+	AlbumPicture  string
 }
 
-func getPlaylist(_accessToken string, url string) (string, error) {
+func getPlaylist(_accessToken string, url string) ([]string, error) {
 
 	// send a request
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to create a request: %v", err)
+		return []string{}, fmt.Errorf("failed to create a request: %v", err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+_accessToken)
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to send the request: %v", err)
+		return []string{}, fmt.Errorf("failed to send the request: %v", err)
 	}
 
 	defer resp.Body.Close()
@@ -149,15 +236,17 @@ func getPlaylist(_accessToken string, url string) (string, error) {
 	// read body in bytes
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %v", err)
+		return []string{}, fmt.Errorf("failed to read response body: %v", err)
 	}
 
 	// parse json
 	var playlist Playlist
 	err = json.Unmarshal(bodyBytes, &playlist)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse json: %v", err)
+		return []string{}, fmt.Errorf("failed to parse json: %v", err)
 	}
+
+	var playlistSlice []string
 
 	for _, item := range playlist.Tracks.Items {
 		_artists := ""
@@ -170,7 +259,7 @@ func getPlaylist(_accessToken string, url string) (string, error) {
 		playlistSlice = append(playlistSlice, _trackData)
 	}
 
-	return "Success!", nil
+	return playlistSlice, nil
 }
 
 func getTrack(searchQuery string) (TrackInfo, error) {
@@ -217,15 +306,29 @@ func getTrack(searchQuery string) (TrackInfo, error) {
 	topResult := results.Data[0]
 
 	return TrackInfo{
-		TrackID:        topResult.TrackID,
-		ArtistID:       topResult.Artist.ArtistId,
-		ArtistName:     topResult.Artist.ArtistName,
-		Title:          topResult.Title,
-		PreviewLink:    topResult.Preview,
-		PreviewPicture: topResult.Artist.Picture,
+		TrackID:       topResult.TrackID,
+		ArtistID:      topResult.Artist.ArtistId,
+		ArtistName:    topResult.Artist.ArtistName,
+		Title:         topResult.Title,
+		PreviewLink:   topResult.Preview,
+		ArtistPicture: topResult.Artist.ArtistPicture,
+		AlbumPicture:  topResult.Album.AlbumPicture,
 	}, nil
 }
 
-func createFolder(trackID string) error {
-	return nil
-}
+// TODO
+
+// Function that fetches lyrics
+// Figure out logic for optimal storage of items
+//   > no duplicates in images (use IDs)
+//   > quick fetching (use deezer ID to name folders)
+// Function that stores track data and lyrics
+// Function that reads that data
+
+// Storage structure
+//
+// . /img
+//       /artist > 74309.jpg
+//       /album  > 6425418.jpg
+//
+// ./ track_data > 65546431.txt > track_data + lyrics
